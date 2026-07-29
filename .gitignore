@@ -1,0 +1,23 @@
+# Gradle / 构建产物
+.gradle/
+build/
+*.apk
+*.aab
+local.properties
+
+# IDE
+.idea/
+*.iml
+*.iws
+.kotlin/
+captures/
+
+# 签名（永远不要提交）
+*.jks
+*.keystore
+keystore.properties
+signing.properties
+
+# 系统
+.DS_Store
+Thumbs.db

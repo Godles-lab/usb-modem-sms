@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- 必须写十进制：0x2CA3 = 11427, 0x4006 = 16390 -->
+    <usb-device vendor-id="11427" product-id="16390" />
+
+    <!-- 如果已把模块改成移远标准 ID，解开这一行：0x2C7C=11388, 0x0125=293 -->
+    <!-- <usb-device vendor-id="11388" product-id="293" /> -->
+</resources>
