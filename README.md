@@ -8,6 +8,19 @@
 > 为兼容 DJI 增强图传模块（内核为 Quectel EG25-G）而写，同样适用于其他移远/高通平台模组。
 > 本项目与 DJI、Quectel 均无任何关联，未获得也未寻求其授权或背书。
 
+<table>
+<tr>
+<td width="50%" align="center">
+<img src="docs/usb-modes.jpg" width="280" alt="USB 网络模式切换面板，列出 QMI、ECM、MBIM、RNDIS 四种模式及适用主机"><br>
+<sub>USB 模式切换，当前模式高亮，高风险项单独标注</sub>
+</td>
+<td width="50%" align="center">
+<img src="docs/at-console.jpg" width="280" alt="AT 控制台，显示 QCFG usbnet 查询的原始响应"><br>
+<sub>AT 控制台，指令原样下发、响应原样回显</sub>
+</td>
+</tr>
+</table>
+
 ---
 
 ## 为什么不需要驱动
