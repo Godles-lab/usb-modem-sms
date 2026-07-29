@@ -10,13 +10,17 @@
 
 <table>
 <tr>
-<td width="50%" align="center">
-<img src="docs/usb-modes.jpg" width="280" alt="USB 网络模式切换面板，列出 QMI、ECM、MBIM、RNDIS 四种模式及适用主机"><br>
-<sub>USB 模式切换，当前模式高亮，高风险项单独标注</sub>
+<td width="33%" align="center">
+<img src="docs/main.jpg" alt="主界面，短信列表中验证码被单独提取为可点击复制的号码块"><br>
+<sub><b>主界面</b><br>验证码自动提取，点击复制</sub>
 </td>
-<td width="50%" align="center">
-<img src="docs/at-console.jpg" width="280" alt="AT 控制台，显示 QCFG usbnet 查询的原始响应"><br>
-<sub>AT 控制台，指令原样下发、响应原样回显</sub>
+<td width="33%" align="center">
+<img src="docs/usb-modes.jpg" alt="USB 网络模式切换面板，列出 QMI、ECM、MBIM、RNDIS 四种模式及适用主机"><br>
+<sub><b>USB 模式</b><br>当前模式高亮，高风险项标注</sub>
+</td>
+<td width="33%" align="center">
+<img src="docs/at-console.jpg" alt="AT 控制台，显示 QCFG usbnet 查询的原始响应"><br>
+<sub><b>AT 控制台</b><br>指令原样下发，响应原样回显</sub>
 </td>
 </tr>
 </table>
