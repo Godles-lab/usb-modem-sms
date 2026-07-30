@@ -38,6 +38,12 @@ android {
                 storePassword = signingValue("KEYSTORE_PASSWORD", "storePassword")
                 keyAlias = signingValue("KEY_ALIAS", "keyAlias")
                 keyPassword = signingValue("KEY_PASSWORD", "keyPassword")
+                // minSdk 26 时 AGP 默认只写 v2。侧载是本项目唯一的分发方式，
+                // 部分国产 ROM 的安装器、分身与备份工具仍会去读 v1(JAR) 签名，
+                // 读不到就报「解析包错误」。三种一起签，成本只有几十 KB。
+                enableV1Signing = true
+                enableV2Signing = true
+                enableV3Signing = true
             }
         }
     }
