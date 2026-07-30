@@ -1,5 +1,6 @@
 package dev.usbsms
 
+import android.os.Build
 import androidx.compose.animation.core.RepeatMode
 import androidx.compose.animation.core.animateFloat
 import androidx.compose.animation.core.infiniteRepeatable
@@ -20,11 +21,13 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
-import androidx.compose.foundation.layout.imePadding
+import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.navigationBarsPadding
+import androidx.compose.foundation.layout.safeDrawing
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
-import androidx.compose.foundation.layout.statusBarsPadding
+import androidx.compose.foundation.layout.widthIn
+import androidx.compose.foundation.layout.windowInsetsPadding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
@@ -87,6 +90,7 @@ fun Screen(
     onRunAt: (String) -> Unit,
     onClearConsole: () -> Unit,
     onRefreshIfaces: () -> Unit,
+    onCopied: (String) -> Unit,
     onRestore: () -> Unit,
 ) {
     var number by remember { mutableStateOf("") }
@@ -181,7 +185,13 @@ fun Screen(
     }
 
     Box(Modifier.fillMaxSize().background(Ink)) {
-        Column(Modifier.fillMaxSize().statusBarsPadding().navigationBarsPadding().imePadding()) {
+        Column(
+            Modifier
+                .fillMaxSize()
+                .widthIn(max = 680.dp)          // 平板/折叠屏上不要拉太宽
+                .align(Alignment.TopCenter)
+                .windowInsetsPadding(WindowInsets.safeDrawing)
+        ) {
 
             Header(connected, busy, onConnect, onRefresh, menuOpen,
                 { menuOpen = it }, { confirmFlag = it }, { modeSheet = true; onReadMode() },
@@ -223,7 +233,7 @@ fun Screen(
                     contentPadding = PaddingValues(16.dp),
                 ) {
                     items(sms, key = { it.index }) { m ->
-                        MessageCard(m, busy, onDeleteOne)
+                        MessageCard(m, busy, onDeleteOne, onCopied)
                     }
                 }
             }
@@ -429,7 +439,12 @@ private fun StorageRow(
 // ---------- 短信卡片 ----------
 
 @Composable
-private fun MessageCard(m: Sms, busy: Boolean, onDelete: (Int) -> Unit) {
+private fun MessageCard(
+    m: Sms,
+    busy: Boolean,
+    onDelete: (Int) -> Unit,
+    onCopied: (String) -> Unit,
+) {
     val clip = LocalClipboardManager.current
     Column(
         Modifier

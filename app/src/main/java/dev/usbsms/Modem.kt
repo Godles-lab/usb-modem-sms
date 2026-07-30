@@ -8,6 +8,7 @@ import android.hardware.usb.UsbDevice
 import android.hardware.usb.UsbDeviceConnection
 import android.hardware.usb.UsbEndpoint
 import android.hardware.usb.UsbManager
+import android.os.Build
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -166,10 +167,17 @@ class Modem(private val ctx: Context) {
 
     fun requestPermission(dev: UsbDevice) {
         val mgr = ctx.getSystemService(Context.USB_SERVICE) as UsbManager
+        // FLAG_MUTABLE 是 API 31 引入的常量。31+ 必须可变，
+        // 因为系统要往 Intent 里填 EXTRA_DEVICE；低版本没有这个概念。
+        val flags = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_MUTABLE
+        } else {
+            PendingIntent.FLAG_UPDATE_CURRENT
+        }
         val pi = PendingIntent.getBroadcast(
             ctx, 0,
             Intent(ACTION_USB_PERMISSION).setPackage(ctx.packageName),
-            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_MUTABLE,
+            flags,
         )
         mgr.requestPermission(dev, pi)
     }
@@ -179,6 +187,29 @@ class Modem(private val ctx: Context) {
      * 写死接口号会导致再也连不上，所以逐个试到谁回 OK 为止。
      * 返回 null 表示成功。
      */
+    /** 不需要建立连接，只读 USB 描述符。诊断与探测都依赖它。 */
+    fun describe(dev: UsbDevice): List<IfaceInfo> =
+        (0 until dev.interfaceCount).map { i ->
+            val intf = dev.getInterface(i)
+            var bin = false
+            var bout = false
+            for (k in 0 until intf.endpointCount) {
+                val ep = intf.getEndpoint(k)
+                if (ep.type != UsbConstants.USB_ENDPOINT_XFER_BULK) continue
+                if (ep.direction == UsbConstants.USB_DIR_IN) bin = true else bout = true
+            }
+            IfaceInfo(
+                index = i,
+                cls = intf.interfaceClass,
+                subCls = intf.interfaceSubclass,
+                proto = intf.interfaceProtocol,
+                bulkIn = bin,
+                bulkOut = bout,
+                epCount = intf.endpointCount,
+                inUse = i == atInterface,
+            )
+        }
+
     /**
      * 打开并探测 AT 口，分三级递进：
      *   1) 快速：每个候选接口试一次 AT，命中即返回（正常情况一两秒完成）

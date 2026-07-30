@@ -116,6 +116,9 @@ class MainActivity : ComponentActivity() {
                     onRunAt = { c -> lifecycleScope.launch { runAt(c) } },
                     onClearConsole = { console = "" },
                     onRefreshIfaces = ::refreshIfaces,
+                    onCopied = { c ->
+                        lifecycleScope.launch { snackbar.showSnackbar("已复制 $c") }
+                    },
                     onRestore = { lifecycleScope.launch { restore() } },
                 )
             }
