@@ -32,6 +32,8 @@ class MainActivity : ComponentActivity() {
     private var connected by mutableStateOf(false)
     private var busy by mutableStateOf(false)
     private var connecting = false
+    /** busy 期间到达的 +CMTI 记在这里，操作结束后补一次刷新 */
+    private var refreshPending = false
     private var current by mutableStateOf("ME")
     private var tele by mutableStateOf(Telemetry())
     private var netMode by mutableStateOf<Int?>(null)
@@ -236,6 +238,7 @@ class MainActivity : ComponentActivity() {
         val ok = runCatching { saveBackup(); true }.getOrDefault(false)
         busy = false
         snackbar.showSnackbar(if (ok) "已把当前配置存为恢复点" else "读取配置失败")
+        drainRefresh()
     }
 
     private suspend fun saveBackup() {
@@ -279,6 +282,7 @@ class MainActivity : ComponentActivity() {
             if (isNotEmpty()) append("\n\n")
             append("> ").append(cmd).append('\n').append(shown)
         }.takeLast(8000)
+        drainRefresh()
     }
 
     /** 单独重读一次 USB 模式，不用重新插拔 */
@@ -304,16 +308,39 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    /**
+     * +CMTI 的刷新请求走的也是这里，而模块只有一条 AT 通道，忙的时候没法插队。
+     * 早先直接 `if (busy) return`，于是发短信或切存储区期间到的新短信被静默丢掉，
+     * 界面上要等用户手动点刷新才出现——正是「插着当验证码接收器」最怕的失效方式。
+     * 现在忙就记账，等当前操作让出通道再补。
+     */
     private suspend fun refresh() {
-        if (!connected || busy) return
+        if (!connected) return
+        if (busy) {
+            refreshPending = true
+            return
+        }
         busy = true
-        tele = runCatching { modem.telemetry() }.getOrDefault(Telemetry())
-        val list = runCatching { modem.listSms() }.getOrDefault(emptyList())
-        smsList.clear(); smsList.addAll(list)
-        storages.clear()
-        storages.addAll(runCatching { modem.storageInfo() }.getOrDefault(emptyList()))
-        current = modem.storage
-        busy = false
+        try {
+            // 拉取期间又来 +CMTI，说明还有更新的短信没收进来，再跑一轮
+            do {
+                refreshPending = false
+                tele = runCatching { modem.telemetry() }.getOrDefault(Telemetry())
+                val list = runCatching { modem.listSms() }.getOrDefault(emptyList())
+                smsList.clear(); smsList.addAll(list)
+                storages.clear()
+                storages.addAll(runCatching { modem.storageInfo() }.getOrDefault(emptyList()))
+                current = modem.storage
+            } while (refreshPending && connected)
+        } finally {
+            refreshPending = false
+            busy = false
+        }
+    }
+
+    /** 占用 AT 通道的操作收尾时调用，把攒下的刷新请求补上。 */
+    private suspend fun drainRefresh() {
+        if (refreshPending) refresh()
     }
 
     private suspend fun pickStorage(name: String) {
@@ -321,7 +348,7 @@ class MainActivity : ComponentActivity() {
         busy = true
         val err = modem.setStorage(name)
         busy = false
-        if (err != null) snackbar.showSnackbar(err) else refresh()
+        if (err != null) { snackbar.showSnackbar(err); drainRefresh() } else refresh()
     }
 
     private suspend fun send(number: String, text: String) {
@@ -331,7 +358,7 @@ class MainActivity : ComponentActivity() {
             .getOrElse { it.message ?: "发送异常" }
         busy = false
         snackbar.showSnackbar(err ?: "已发送")
-        if (err == null) refresh()
+        if (err == null) refresh() else drainRefresh()
     }
 
     private suspend fun deleteOne(index: Int) {
@@ -339,7 +366,7 @@ class MainActivity : ComponentActivity() {
         busy = true
         val err = modem.deleteOne(index)
         busy = false
-        if (err != null) snackbar.showSnackbar(err) else refresh()
+        if (err != null) { snackbar.showSnackbar(err); drainRefresh() } else refresh()
     }
 
     private suspend fun deleteBulk(flag: Int) {
@@ -347,6 +374,6 @@ class MainActivity : ComponentActivity() {
         busy = true
         val err = modem.deleteBulk(flag)
         busy = false
-        if (err != null) snackbar.showSnackbar(err) else refresh()
+        if (err != null) { snackbar.showSnackbar(err); drainRefresh() } else refresh()
     }
 }
