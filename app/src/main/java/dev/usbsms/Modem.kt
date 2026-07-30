@@ -58,27 +58,72 @@ data class NetMode(
 
 val NET_MODES = listOf(
     NetMode(
-        0, "QMI / RMNET", "Linux · Windows（需装驱动）",
-        "出厂默认。高通私有协议，性能和可控性最好，路由器/软路由都用它。" +
-            "但 macOS 和 iPad 没有也不可能有驱动。",
+        0, "QMI / RMNET", "Linux 免驱 · Windows 需驱动",
+        "出厂默认。高通私有协议，性能和可控性最好，软路由/树莓派做 4G 网关都用它。" +
+            "Linux 靠 qmi_wwan 内置支持；Windows 要装移远 NDIS 驱动。" +
+            "macOS 和 iPad 没有也不可能有驱动。",
     ),
     NetMode(
-        1, "ECM", "macOS · iPad · Linux",
-        "标准 CDC 以太网。插上就是一块普通网卡，自动拨号，完全免驱。" +
-            "Windows 没有原生 ECM 支持。",
+        1, "ECM", "macOS · iPad · Linux 免驱",
+        "标准 CDC 以太网，覆盖面最广的选择。模块内部自动建立数据呼叫，" +
+            "主机跑 DHCP 就能上网（网段 192.168.225.x）。" +
+            "macOS / iPadOS / Linux 全部免驱；Windows 装移远官方 ECM 驱动同样可用。",
     ),
     NetMode(
-        2, "MBIM", "Windows · Linux",
-        "微软的移动宽带标准。Windows 8 以上会把它当成真正的蜂窝网卡，" +
-            "在系统设置里直接管理。macOS 和安卓不支持。",
+        2, "MBIM", "Windows 免驱 · Linux 免驱",
+        "微软移动宽带标准，也是 USB-IF 标准类。Windows 8 以上内置驱动，" +
+            "会当成真正的蜂窝网卡在系统设置里管理，是 Windows 下最省事的选择。" +
+            "Linux 靠 cdc_mbim 支持。macOS 不支持。",
     ),
     NetMode(
-        3, "RNDIS", "Windows · 安卓 · 鸿蒙",
-        "以太网over USB。安卓 ROM 普遍带 rndis_host 驱动，是手机上最可能直接联网的模式。" +
-            "但已知部分固件切过去后 AT 口消失，届时只能接电脑用 Linux 恢复。",
+        3, "RNDIS", "仅 Windows XP/7 等老系统",
+        "微软的以太网over USB，属于遗留兼容模式。Linux 的 rndis_host 已被标记弃用。" +
+            "切换后 AT 串口位置会变、数量可能减少——社区里大量「模块变砖」的报告" +
+            "其实是主机写死了原来的串口号。本 App 遍历接口探测，通常能自己找回来，但不保证。" +
+            "ECM 与 MBIM 已覆盖所有现代平台，除非要接 XP/Win7 老设备，否则没有理由选它。",
         risky = true,
     ),
 )
+
+/** 单个 USB 接口的描述，用于诊断当前组合。 */
+data class IfaceInfo(
+    val index: Int,
+    val cls: Int,
+    val subCls: Int,
+    val proto: Int,
+    val bulkIn: Boolean,
+    val bulkOut: Boolean,
+    val epCount: Int,
+    val inUse: Boolean = false,
+) {
+    /** 有成对 bulk 端点才可能是 AT 串口 */
+    val candidate: Boolean get() = bulkIn && bulkOut
+
+    val role: String
+        get() = when {
+            cls == 0xFF && candidate -> "厂商自定义 · 可能是串口"
+            cls == 0xFF -> "厂商自定义"
+            cls == 0x02 && subCls == 0x0E -> "CDC 控制 · MBIM"
+            cls == 0x02 && subCls == 0x06 -> "CDC 控制 · ECM"
+            cls == 0x02 && proto == 0xFF -> "CDC 控制 · RNDIS"
+            cls == 0x02 -> "CDC 控制"
+            cls == 0x0A -> "CDC 数据"
+            cls == 0xE0 -> "无线控制 · RNDIS"
+            cls == 0x01 -> "音频 · UAC"
+            cls == 0x08 -> "大容量存储"
+            else -> "未知类"
+        }
+
+    val descriptor: String
+        get() = "IF%d  %02X/%02X/%02X  %d 端点%s".format(
+            index, cls, subCls, proto, epCount,
+            if (bulkIn && bulkOut) "  bulk in+out" else if (bulkIn) "  仅 bulk in"
+            else if (bulkOut) "  仅 bulk out" else "",
+        )
+}
+
+/** 切换模式前保存的原始配置，用于恢复。 */
+data class ConfigBackup(val usbnet: String, val usbcfg: String, val savedAt: Long)
 
 /** 顶部状态行的实时读数。 */
 data class Telemetry(
@@ -187,6 +232,106 @@ class Modem(private val ctx: Context) {
         c.close(); conn = null
         return "所有接口都不响应 AT 指令。模块可能切到了不带串口的 USB 组合，" +
             "需要接电脑用 Linux 发 AT+QCFG=\"usbnet\",0 恢复。"
+    }
+
+    /** 不需要连接，只读 USB 描述符。诊断用。 */
+    fun describe(dev: UsbDevice): List<IfaceInfo> =
+        (0 until dev.interfaceCount).map { i ->
+            val intf = dev.getInterface(i)
+            var bin = false
+            var bout = false
+            for (k in 0 until intf.endpointCount) {
+                val ep = intf.getEndpoint(k)
+                if (ep.type != UsbConstants.USB_ENDPOINT_XFER_BULK) continue
+                if (ep.direction == UsbConstants.USB_DIR_IN) bin = true else bout = true
+            }
+            IfaceInfo(
+                index = i,
+                cls = intf.interfaceClass,
+                subCls = intf.interfaceSubclass,
+                proto = intf.interfaceProtocol,
+                bulkIn = bin, bulkOut = bout,
+                epCount = intf.endpointCount,
+                inUse = i == atInterface,
+            )
+        }
+
+    /**
+     * 救援模式：加长超时、多轮重试、多种指令变体、DTR 开关都试。
+     * 专治「切换 usbnet 后 AT 口移位 / 模块刚重启还没稳定」。
+     */
+    suspend fun openDeep(dev: UsbDevice, log: (String) -> Unit): String? {
+        close()
+        val mgr = ctx.getSystemService(Context.USB_SERVICE) as UsbManager
+        val c = mgr.openDevice(dev) ?: return "打开设备失败，通常是没有授权。"
+        conn = c
+
+        val cands = (0 until dev.interfaceCount).filter { i ->
+            val intf = dev.getInterface(i)
+            var bin = false; var bout = false
+            for (k in 0 until intf.endpointCount) {
+                val ep = intf.getEndpoint(k)
+                if (ep.type != UsbConstants.USB_ENDPOINT_XFER_BULK) continue
+                if (ep.direction == UsbConstants.USB_DIR_IN) bin = true else bout = true
+            }
+            bin && bout
+        }
+
+        log("共 ${dev.interfaceCount} 个接口，其中 ${cands.size} 个带成对 bulk 端点")
+        if (cands.isEmpty()) {
+            c.close(); conn = null
+            return "没有任何接口带成对 bulk 端点。模块的 USB 组合里已不含串口，" +
+                "手机端无法恢复，需要接电脑处理。"
+        }
+
+        val variants = listOf("AT\r\n", "AT\r", "ATE0\r\n", "ATI\r\n")
+
+        for (round in 1..3) {
+            log("── 第 $round / 3 轮")
+            for (idx in cands) {
+                val intf = dev.getInterface(idx)
+                if (!c.claimInterface(intf, true)) {
+                    log("IF$idx 无法占用，跳过")
+                    continue
+                }
+
+                var i: UsbEndpoint? = null
+                var o: UsbEndpoint? = null
+                for (k in 0 until intf.endpointCount) {
+                    val ep = intf.getEndpoint(k)
+                    if (ep.type != UsbConstants.USB_ENDPOINT_XFER_BULK) continue
+                    if (ep.direction == UsbConstants.USB_DIR_IN) i = ep else o = ep
+                }
+                epIn = i; epOut = o
+
+                for (dtr in listOf(true, false)) {
+                    if (dtr) c.controlTransfer(0x21, 0x22, 0x03, idx, null, 0, 1000)
+                    startReader()
+                    for (v in variants) {
+                        clear(); delay(60)
+                        write(v)
+                        if (await("OK", "Quectel", timeoutMs = 2500)) {
+                            atInterface = idx
+                            prepared = false
+                            log("✓ IF$idx 响应了（${v.trim()}，DTR ${if (dtr) "开" else "关"}）")
+                            return null
+                        }
+                    }
+                    readerJob?.cancel(); readerJob = null
+                }
+                log("IF$idx 无响应")
+                runCatching { c.releaseInterface(intf) }
+                epIn = null; epOut = null
+            }
+            if (round < 3) {
+                log("等 8 秒后重试，模块可能仍在启动")
+                delay(8000)
+            }
+        }
+
+        c.close(); conn = null
+        return "三轮探测都没有接口响应 AT。若刚切换过 usbnet，再等一分钟重试；" +
+            "仍然不行则需要接电脑用 Linux 恢复。"
     }
 
     fun close() {
@@ -439,6 +584,21 @@ class Modem(private val ctx: Context) {
     }
 
     // ---------- USB 网络模式 ----------
+
+    /** 读出 usbnet 与 usbcfg 的原始返回，切换前备份用。 */
+    suspend fun readBackup(): ConfigBackup? = ioLock.withLock {
+        prepare()
+        at("AT+CSCS=\"GSM\"")
+        try {
+            val net = at("AT+QCFG=\"usbnet\"", expect = "+QCFG:")
+                .lines().firstOrNull { it.contains("+QCFG:") }?.trim() ?: return@withLock null
+            val cfg = at("AT+QCFG=\"usbcfg\"", expect = "+QCFG:")
+                .lines().firstOrNull { it.contains("+QCFG:") }?.trim() ?: ""
+            ConfigBackup(net, cfg, System.currentTimeMillis())
+        } finally {
+            at("AT+CSCS=\"UCS2\"")
+        }
+    }
 
     /** 读当前 usbnet 值。返回 null 表示固件不支持这个参数。 */
     suspend fun usbnetMode(): Int? = ioLock.withLock {

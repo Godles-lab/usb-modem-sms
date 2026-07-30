@@ -4,6 +4,7 @@ import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
+import android.content.SharedPreferences
 import android.hardware.usb.UsbManager
 import android.os.Build
 import android.os.Bundle
@@ -34,6 +35,14 @@ class MainActivity : ComponentActivity() {
     private var netMode by mutableStateOf<Int?>(null)
     private var modeLoading by mutableStateOf(false)
     private var console by mutableStateOf("")
+    private var rescueLog by mutableStateOf("")
+    private var rescuing by mutableStateOf(false)
+    private var backup by mutableStateOf<ConfigBackup?>(null)
+    private val ifaces = mutableStateListOf<IfaceInfo>()
+
+    private val prefs: SharedPreferences by lazy {
+        getSharedPreferences("modemsms", MODE_PRIVATE)
+    }
     private var atIf by mutableStateOf(-1)
 
     private val snackbar = SnackbarHostState()
@@ -66,6 +75,7 @@ class MainActivity : ComponentActivity() {
 
         modem = Modem(this)
         modem.onNewSms = { lifecycleScope.launch { refresh() } }
+        loadBackup()
 
         val filter = IntentFilter().apply {
             addAction(ACTION_USB_PERMISSION)
@@ -89,6 +99,10 @@ class MainActivity : ComponentActivity() {
                     netMode = netMode,
                     modeLoading = modeLoading,
                     console = console,
+                    rescueLog = rescueLog,
+                    rescuing = rescuing,
+                    backup = backup,
+                    ifaces = ifaces,
                     atIf = atIf,
                     sms = smsList,
                     storages = storages,
@@ -105,6 +119,9 @@ class MainActivity : ComponentActivity() {
                     onReadMode = { lifecycleScope.launch { readMode() } },
                     onRunAt = { c -> lifecycleScope.launch { runAt(c) } },
                     onClearConsole = { console = "" },
+                    onRescue = { lifecycleScope.launch { rescue() } },
+                    onRefreshIfaces = ::refreshIfaces,
+                    onRestore = { lifecycleScope.launch { restore() } },
                 )
             }
         }
@@ -150,8 +167,85 @@ class MainActivity : ComponentActivity() {
             supported.addAll(modem.supportedStorages())
             current = modem.storage
             netMode = modem.usbnetMode()
+            refreshIfaces()
+            if (backup == null) saveBackup()
             refresh()
         }
+    }
+
+    // ---------- 救援 / 诊断 / 备份 ----------
+
+    /** 深度探测。切换 usbnet 后 AT 口移位、或模块刚重启没稳定时用。 */
+    private suspend fun rescue() {
+        if (rescuing) return
+        val dev = modem.findDevice()
+        if (dev == null) {
+            rescueLog = "没找到设备。确认已插好，并使用带外部供电的 OTG 转接头。"
+            return
+        }
+        if (!modem.hasPermission(dev)) {
+            modem.requestPermission(dev)
+            return
+        }
+        rescuing = true
+        rescueLog = "开始深度探测…\n"
+        val err = modem.openDeep(dev) { line ->
+            rescueLog = (rescueLog + line + "\n").takeLast(4000)
+        }
+        rescuing = false
+        if (err == null) {
+            connected = true
+            atIf = modem.atIfIndex
+            rescueLog += "\n已连接，AT 口在 IF${modem.atIfIndex}\n"
+            modem.init()
+            supported.clear(); supported.addAll(modem.supportedStorages())
+            current = modem.storage
+            netMode = modem.usbnetMode()
+            refreshIfaces()
+            refresh()
+        } else {
+            rescueLog += "\n$err\n"
+        }
+    }
+
+    private fun refreshIfaces() {
+        ifaces.clear()
+        modem.findDevice()?.let { ifaces.addAll(modem.describe(it)) }
+    }
+
+    private fun loadBackup() {
+        val net = prefs.getString("bk_usbnet", null) ?: return
+        backup = ConfigBackup(
+            net,
+            prefs.getString("bk_usbcfg", "") ?: "",
+            prefs.getLong("bk_at", 0L),
+        )
+    }
+
+    private suspend fun saveBackup() {
+        val b = runCatching { modem.readBackup() }.getOrNull() ?: return
+        prefs.edit()
+            .putString("bk_usbnet", b.usbnet)
+            .putString("bk_usbcfg", b.usbcfg)
+            .putLong("bk_at", b.savedAt)
+            .apply()
+        backup = b
+    }
+
+    /** 按备份里的 usbnet 值恢复。 */
+    private suspend fun restore() {
+        val b = backup ?: return
+        val m = Regex("""(\d+)\s*$""").find(b.usbnet.trim())
+            ?.groupValues?.get(1)?.toIntOrNull()
+        if (m == null) {
+            snackbar.showSnackbar("备份里解析不出模式值：${b.usbnet}")
+            return
+        }
+        if (m == netMode) {
+            snackbar.showSnackbar("当前已是备份中的模式（$m），无需恢复")
+            return
+        }
+        setMode(m)
     }
 
     /** 直接下发任意 AT 指令，原样回显。排查用。 */

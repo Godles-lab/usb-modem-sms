@@ -68,6 +68,10 @@ fun Screen(
     netMode: Int?,
     modeLoading: Boolean,
     console: String,
+    rescueLog: String,
+    rescuing: Boolean,
+    backup: ConfigBackup?,
+    ifaces: List<IfaceInfo>,
     atIf: Int,
     sms: List<Sms>,
     storages: List<Storage>,
@@ -84,6 +88,9 @@ fun Screen(
     onReadMode: () -> Unit,
     onRunAt: (String) -> Unit,
     onClearConsole: () -> Unit,
+    onRescue: () -> Unit,
+    onRefreshIfaces: () -> Unit,
+    onRestore: () -> Unit,
 ) {
     var number by remember { mutableStateOf("") }
     var text by remember { mutableStateOf("") }
@@ -92,6 +99,8 @@ fun Screen(
     var modeSheet by remember { mutableStateOf(false) }
     var confirmMode by remember { mutableStateOf<NetMode?>(null) }
     var consoleOpen by remember { mutableStateOf(false) }
+    var rescueOpen by remember { mutableStateOf(false) }
+    var ifaceOpen by remember { mutableStateOf(false) }
 
     confirmFlag?.let { flag ->
         AlertDialog(
@@ -117,6 +126,14 @@ fun Screen(
         )
     }
 
+    if (rescueOpen) {
+        RescueDialog(rescueLog, rescuing, onRescue) { rescueOpen = false }
+    }
+
+    if (ifaceOpen) {
+        IfaceDialog(ifaces, onRefreshIfaces) { ifaceOpen = false }
+    }
+
     if (consoleOpen) {
         ConsoleDialog(console, busy, onRunAt, onClearConsole) { consoleOpen = false }
     }
@@ -126,7 +143,9 @@ fun Screen(
             current = netMode,
             loading = modeLoading,
             busy = busy,
+            backup = backup,
             onReload = onReadMode,
+            onRestore = onRestore,
             onDismiss = { modeSheet = false },
             onPick = { m -> modeSheet = false; confirmMode = m },
         )
@@ -170,7 +189,9 @@ fun Screen(
 
             Header(connected, busy, onConnect, onRefresh, menuOpen,
                 { menuOpen = it }, { confirmFlag = it }, { modeSheet = true; onReadMode() },
-                { consoleOpen = true })
+                { consoleOpen = true },
+                { rescueOpen = true },
+                { ifaceOpen = true; onRefreshIfaces() })
 
             TelemetryStrip(connected, tele, status, netMode, atIf)
 
@@ -180,7 +201,27 @@ fun Screen(
 
             Box(Modifier.fillMaxWidth().height(1.dp).background(Hairline))
 
-            if (sms.isEmpty()) {
+            if (!connected) {
+                Column(
+                    Modifier.weight(1f).fillMaxWidth().padding(24.dp),
+                    verticalArrangement = Arrangement.Center,
+                    horizontalAlignment = Alignment.CenterHorizontally,
+                ) {
+                    Text("未连接模块", color = TextLo, fontSize = 15.sp)
+                    Spacer(Modifier.height(10.dp))
+                    Text(
+                        "如果刚切换过 USB 模式，AT 口可能已经移位。" +
+                            "救援模式会加长超时、多轮遍历所有接口。",
+                        style = Readout, color = Hairline,
+                        lineHeight = 17.sp,
+                    )
+                    Spacer(Modifier.height(16.dp))
+                    Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                        Pill("重新连接", PanelHi, TextHi, onClick = onConnect)
+                        Pill("救援模式", Signal, Ink) { rescueOpen = true }
+                    }
+                }
+            } else if (sms.isEmpty()) {
                 Empty(connected, current, Modifier.weight(1f))
             } else {
                 LazyColumn(
@@ -218,6 +259,8 @@ private fun Header(
     setConfirm: (Int) -> Unit,
     openModes: () -> Unit,
     openConsole: () -> Unit,
+    openRescue: () -> Unit,
+    openIfaces: () -> Unit,
 ) {
     Row(
         Modifier.fillMaxWidth().padding(start = 16.dp, end = 8.dp, top = 14.dp, bottom = 10.dp),
@@ -253,6 +296,14 @@ private fun Header(
                     DropdownMenuItem(
                         text = { Text("AT 控制台", color = TextHi) },
                         onClick = { setMenu(false); openConsole() },
+                    )
+                    DropdownMenuItem(
+                        text = { Text("USB 接口一览", color = TextHi) },
+                        onClick = { setMenu(false); openIfaces() },
+                    )
+                    DropdownMenuItem(
+                        text = { Text("救援模式", color = Signal) },
+                        onClick = { setMenu(false); openRescue() },
                     )
                     DropdownMenuItem(
                         text = { Text("删除已读", color = TextHi) },
@@ -581,7 +632,9 @@ private fun ModeDialog(
     current: Int?,
     loading: Boolean,
     busy: Boolean,
+    backup: ConfigBackup?,
     onReload: () -> Unit,
+    onRestore: () -> Unit,
     onDismiss: () -> Unit,
     onPick: (NetMode) -> Unit,
 ) {
@@ -608,6 +661,36 @@ private fun ModeDialog(
                         Spacer(Modifier.height(12.dp))
                     }
                 }
+                backup?.let { b ->
+                    Box(
+                        Modifier
+                            .fillMaxWidth()
+                            .background(Signal.copy(alpha = 0.08f), RoundedCornerShape(10.dp))
+                            .border(1.dp, Signal.copy(alpha = 0.35f), RoundedCornerShape(10.dp))
+                            .padding(10.dp)
+                    ) {
+                        Column {
+                            Text("已备份原始配置", style = Readout, color = Signal)
+                            Spacer(Modifier.height(4.dp))
+                            Text(
+                                b.usbnet,
+                                fontSize = 11.sp,
+                                fontFamily = FontFamily.Monospace,
+                                color = TextLo,
+                            )
+                            if (b.usbcfg.isNotBlank()) {
+                                Text(
+                                    b.usbcfg,
+                                    fontSize = 11.sp,
+                                    fontFamily = FontFamily.Monospace,
+                                    color = TextLo,
+                                )
+                            }
+                        }
+                    }
+                    Spacer(Modifier.height(10.dp))
+                }
+
                 NET_MODES.forEach { m ->
                     val on = m.code == current
                     Column(
@@ -652,8 +735,15 @@ private fun ModeDialog(
             TextButton(onClick = onDismiss) { Text("关闭", color = TextLo) }
         },
         dismissButton = {
-            TextButton(onClick = onReload, enabled = !loading && !busy) {
-                Text("重新读取", color = if (loading) Hairline else Amber)
+            Row {
+                if (backup != null) {
+                    TextButton(onClick = onRestore, enabled = !busy) {
+                        Text("恢复备份", color = Signal)
+                    }
+                }
+                TextButton(onClick = onReload, enabled = !loading && !busy) {
+                    Text("重新读取", color = if (loading) Hairline else Amber)
+                }
             }
         },
     )
@@ -766,5 +856,129 @@ private fun ConsoleDialog(
         },
         confirmButton = { TextButton(onClick = onDismiss) { Text("关闭", color = TextLo) } },
         dismissButton = { TextButton(onClick = onClear) { Text("清空", color = TextLo) } },
+    )
+}
+
+
+// ---------- 救援模式 ----------
+
+@Composable
+private fun RescueDialog(
+    log: String,
+    running: Boolean,
+    onStart: () -> Unit,
+    onDismiss: () -> Unit,
+) {
+    val scroll = rememberScrollState()
+    LaunchedEffect(log) { scroll.animateScrollTo(scroll.maxValue) }
+
+    AlertDialog(
+        containerColor = Panel,
+        titleContentColor = TextHi,
+        onDismissRequest = { if (!running) onDismiss() },
+        title = { Text("救援模式") },
+        text = {
+            Column {
+                Text(
+                    "切换 usbnet 后 AT 串口的位置会变，很多人以为模块坏了，" +
+                        "其实只是不在原来那个接口上了。\n\n" +
+                        "救援模式会遍历所有带 bulk 端点的接口，每个都试 " +
+                        "AT / ATI 等多种指令、DTR 开关两种状态，共三轮，" +
+                        "轮间等待 8 秒以应对模块尚未启动完成。",
+                    color = TextLo, fontSize = 12.sp, lineHeight = 18.sp,
+                )
+                Spacer(Modifier.height(12.dp))
+                Box(
+                    Modifier
+                        .fillMaxWidth()
+                        .height(200.dp)
+                        .background(Ink, RoundedCornerShape(10.dp))
+                        .border(1.dp, Hairline, RoundedCornerShape(10.dp))
+                        .verticalScroll(scroll)
+                        .padding(10.dp)
+                ) {
+                    Text(
+                        log.ifBlank { "点「开始探测」。整个过程最长约 1 分钟。" },
+                        color = if (log.isBlank()) TextLo else TextHi,
+                        fontSize = 11.sp, lineHeight = 16.sp,
+                        fontFamily = FontFamily.Monospace,
+                    )
+                }
+            }
+        },
+        confirmButton = {
+            TextButton(onClick = onStart, enabled = !running) {
+                Text(if (running) "探测中…" else "开始探测", color = if (running) Hairline else Signal)
+            }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss, enabled = !running) {
+                Text("关闭", color = TextLo)
+            }
+        },
+    )
+}
+
+// ---------- USB 接口一览 ----------
+
+@Composable
+private fun IfaceDialog(
+    ifaces: List<IfaceInfo>,
+    onRefresh: () -> Unit,
+    onDismiss: () -> Unit,
+) {
+    val scroll = rememberScrollState()
+    AlertDialog(
+        containerColor = Panel,
+        titleContentColor = TextHi,
+        onDismissRequest = onDismiss,
+        title = { Text("USB 接口一览") },
+        text = {
+            Column(Modifier.verticalScroll(scroll)) {
+                Text(
+                    "当前 USB 组合下模块暴露的全部接口。" +
+                        "带成对 bulk 端点的才可能是 AT 串口。",
+                    color = TextLo, fontSize = 12.sp, lineHeight = 18.sp,
+                )
+                Spacer(Modifier.height(12.dp))
+
+                if (ifaces.isEmpty()) {
+                    Text("读不到接口，模块可能未插好。", color = Alert, fontSize = 13.sp)
+                }
+
+                ifaces.forEach { f ->
+                    Column(
+                        Modifier
+                            .fillMaxWidth()
+                            .padding(vertical = 3.dp)
+                            .background(
+                                if (f.inUse) Amber.copy(alpha = 0.12f) else PanelHi,
+                                RoundedCornerShape(10.dp),
+                            )
+                            .border(
+                                1.dp,
+                                if (f.inUse) Amber else Hairline,
+                                RoundedCornerShape(10.dp),
+                            )
+                            .padding(10.dp)
+                    ) {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Text(
+                                f.descriptor,
+                                style = Readout,
+                                color = if (f.inUse) Amber else TextHi,
+                                modifier = Modifier.weight(1f),
+                            )
+                            if (f.inUse) Text("使用中", style = Readout, color = Amber)
+                            else if (f.candidate) Text("候选", style = Readout, color = Signal)
+                        }
+                        Spacer(Modifier.height(3.dp))
+                        Text(f.role, color = TextLo, fontSize = 12.sp)
+                    }
+                }
+            }
+        },
+        confirmButton = { TextButton(onClick = onDismiss) { Text("关闭", color = TextLo) } },
+        dismissButton = { TextButton(onClick = onRefresh) { Text("刷新", color = Amber) } },
     )
 }
