@@ -68,8 +68,6 @@ fun Screen(
     netMode: Int?,
     modeLoading: Boolean,
     console: String,
-    rescueLog: String,
-    rescuing: Boolean,
     backup: ConfigBackup?,
     ifaces: List<IfaceInfo>,
     atIf: Int,
@@ -88,7 +86,6 @@ fun Screen(
     onReadMode: () -> Unit,
     onRunAt: (String) -> Unit,
     onClearConsole: () -> Unit,
-    onRescue: () -> Unit,
     onRefreshIfaces: () -> Unit,
     onRestore: () -> Unit,
 ) {
@@ -99,7 +96,6 @@ fun Screen(
     var modeSheet by remember { mutableStateOf(false) }
     var confirmMode by remember { mutableStateOf<NetMode?>(null) }
     var consoleOpen by remember { mutableStateOf(false) }
-    var rescueOpen by remember { mutableStateOf(false) }
     var ifaceOpen by remember { mutableStateOf(false) }
 
     confirmFlag?.let { flag ->
@@ -124,10 +120,6 @@ fun Screen(
                 TextButton(onClick = { confirmFlag = null }) { Text("取消", color = TextLo) }
             },
         )
-    }
-
-    if (rescueOpen) {
-        RescueDialog(rescueLog, rescuing, onRescue) { rescueOpen = false }
     }
 
     if (ifaceOpen) {
@@ -169,7 +161,11 @@ fun Screen(
                             color = Alert,
                         )
                     } else {
-                        Text("ECM / MBIM / QMI 都保留 AT 串口，随时可以切回来。", color = TextLo)
+                        Text(
+                            "四种模式都保留 AT 串口，只是位置可能变化。" +
+                                "本 App 连接时会自动遍历接口找回来，可以随时切回。",
+                            color = TextLo,
+                        )
                     }
                 }
             },
@@ -190,7 +186,6 @@ fun Screen(
             Header(connected, busy, onConnect, onRefresh, menuOpen,
                 { menuOpen = it }, { confirmFlag = it }, { modeSheet = true; onReadMode() },
                 { consoleOpen = true },
-                { rescueOpen = true },
                 { ifaceOpen = true; onRefreshIfaces() })
 
             TelemetryStrip(connected, tele, status, netMode, atIf)
@@ -210,16 +205,14 @@ fun Screen(
                     Text("未连接模块", color = TextLo, fontSize = 15.sp)
                     Spacer(Modifier.height(10.dp))
                     Text(
-                        "如果刚切换过 USB 模式，AT 口可能已经移位。" +
-                            "救援模式会加长超时、多轮遍历所有接口。",
+                        "连接时会自动遍历所有接口探测 AT 口，" +
+                            "切换过 USB 模式导致串口移位也能找回来。" +
+                            "刚重启过模块的话可能要等一会儿。",
                         style = Readout, color = Hairline,
                         lineHeight = 17.sp,
                     )
                     Spacer(Modifier.height(16.dp))
-                    Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-                        Pill("重新连接", PanelHi, TextHi, onClick = onConnect)
-                        Pill("救援模式", Signal, Ink) { rescueOpen = true }
-                    }
+                    Pill("连接", Amber, Ink, onClick = onConnect)
                 }
             } else if (sms.isEmpty()) {
                 Empty(connected, current, Modifier.weight(1f))
@@ -259,7 +252,6 @@ private fun Header(
     setConfirm: (Int) -> Unit,
     openModes: () -> Unit,
     openConsole: () -> Unit,
-    openRescue: () -> Unit,
     openIfaces: () -> Unit,
 ) {
     Row(
@@ -300,10 +292,6 @@ private fun Header(
                     DropdownMenuItem(
                         text = { Text("USB 接口一览", color = TextHi) },
                         onClick = { setMenu(false); openIfaces() },
-                    )
-                    DropdownMenuItem(
-                        text = { Text("救援模式", color = Signal) },
-                        onClick = { setMenu(false); openRescue() },
                     )
                     DropdownMenuItem(
                         text = { Text("删除已读", color = TextHi) },
@@ -644,7 +632,7 @@ private fun ModeDialog(
         onDismissRequest = onDismiss,
         title = { Text("USB 网络模式") },
         text = {
-            Column {
+            Column(Modifier.verticalScroll(rememberScrollState())) {
                 when {
                     loading -> {
                         Text("正在读取当前模式…", color = TextLo, fontSize = 13.sp)
@@ -726,7 +714,7 @@ private fun ModeDialog(
                         Spacer(Modifier.height(4.dp))
                         Text(m.hosts, style = Readout, color = if (on) Amber else TextLo)
                         Spacer(Modifier.height(6.dp))
-                        Text(m.note, color = TextLo, fontSize = 12.sp, lineHeight = 18.sp)
+                        Text(m.note, color = TextLo, fontSize = 12.sp, lineHeight = 17.sp)
                     }
                 }
             }
@@ -859,65 +847,6 @@ private fun ConsoleDialog(
     )
 }
 
-
-// ---------- 救援模式 ----------
-
-@Composable
-private fun RescueDialog(
-    log: String,
-    running: Boolean,
-    onStart: () -> Unit,
-    onDismiss: () -> Unit,
-) {
-    val scroll = rememberScrollState()
-    LaunchedEffect(log) { scroll.animateScrollTo(scroll.maxValue) }
-
-    AlertDialog(
-        containerColor = Panel,
-        titleContentColor = TextHi,
-        onDismissRequest = { if (!running) onDismiss() },
-        title = { Text("救援模式") },
-        text = {
-            Column {
-                Text(
-                    "切换 usbnet 后 AT 串口的位置会变，很多人以为模块坏了，" +
-                        "其实只是不在原来那个接口上了。\n\n" +
-                        "救援模式会遍历所有带 bulk 端点的接口，每个都试 " +
-                        "AT / ATI 等多种指令、DTR 开关两种状态，共三轮，" +
-                        "轮间等待 8 秒以应对模块尚未启动完成。",
-                    color = TextLo, fontSize = 12.sp, lineHeight = 18.sp,
-                )
-                Spacer(Modifier.height(12.dp))
-                Box(
-                    Modifier
-                        .fillMaxWidth()
-                        .height(200.dp)
-                        .background(Ink, RoundedCornerShape(10.dp))
-                        .border(1.dp, Hairline, RoundedCornerShape(10.dp))
-                        .verticalScroll(scroll)
-                        .padding(10.dp)
-                ) {
-                    Text(
-                        log.ifBlank { "点「开始探测」。整个过程最长约 1 分钟。" },
-                        color = if (log.isBlank()) TextLo else TextHi,
-                        fontSize = 11.sp, lineHeight = 16.sp,
-                        fontFamily = FontFamily.Monospace,
-                    )
-                }
-            }
-        },
-        confirmButton = {
-            TextButton(onClick = onStart, enabled = !running) {
-                Text(if (running) "探测中…" else "开始探测", color = if (running) Hairline else Signal)
-            }
-        },
-        dismissButton = {
-            TextButton(onClick = onDismiss, enabled = !running) {
-                Text("关闭", color = TextLo)
-            }
-        },
-    )
-}
 
 // ---------- USB 接口一览 ----------
 

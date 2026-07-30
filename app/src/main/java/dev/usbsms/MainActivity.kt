@@ -35,8 +35,6 @@ class MainActivity : ComponentActivity() {
     private var netMode by mutableStateOf<Int?>(null)
     private var modeLoading by mutableStateOf(false)
     private var console by mutableStateOf("")
-    private var rescueLog by mutableStateOf("")
-    private var rescuing by mutableStateOf(false)
     private var backup by mutableStateOf<ConfigBackup?>(null)
     private val ifaces = mutableStateListOf<IfaceInfo>()
 
@@ -99,8 +97,6 @@ class MainActivity : ComponentActivity() {
                     netMode = netMode,
                     modeLoading = modeLoading,
                     console = console,
-                    rescueLog = rescueLog,
-                    rescuing = rescuing,
                     backup = backup,
                     ifaces = ifaces,
                     atIf = atIf,
@@ -119,7 +115,6 @@ class MainActivity : ComponentActivity() {
                     onReadMode = { lifecycleScope.launch { readMode() } },
                     onRunAt = { c -> lifecycleScope.launch { runAt(c) } },
                     onClearConsole = { console = "" },
-                    onRescue = { lifecycleScope.launch { rescue() } },
                     onRefreshIfaces = ::refreshIfaces,
                     onRestore = { lifecycleScope.launch { restore() } },
                 )
@@ -173,40 +168,7 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    // ---------- 救援 / 诊断 / 备份 ----------
-
-    /** 深度探测。切换 usbnet 后 AT 口移位、或模块刚重启没稳定时用。 */
-    private suspend fun rescue() {
-        if (rescuing) return
-        val dev = modem.findDevice()
-        if (dev == null) {
-            rescueLog = "没找到设备。确认已插好，并使用带外部供电的 OTG 转接头。"
-            return
-        }
-        if (!modem.hasPermission(dev)) {
-            modem.requestPermission(dev)
-            return
-        }
-        rescuing = true
-        rescueLog = "开始深度探测…\n"
-        val err = modem.openDeep(dev) { line ->
-            rescueLog = (rescueLog + line + "\n").takeLast(4000)
-        }
-        rescuing = false
-        if (err == null) {
-            connected = true
-            atIf = modem.atIfIndex
-            rescueLog += "\n已连接，AT 口在 IF${modem.atIfIndex}\n"
-            modem.init()
-            supported.clear(); supported.addAll(modem.supportedStorages())
-            current = modem.storage
-            netMode = modem.usbnetMode()
-            refreshIfaces()
-            refresh()
-        } else {
-            rescueLog += "\n$err\n"
-        }
-    }
+    // ---------- 诊断 / 备份 ----------
 
     private fun refreshIfaces() {
         ifaces.clear()

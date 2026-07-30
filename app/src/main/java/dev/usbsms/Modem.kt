@@ -18,6 +18,7 @@ import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withContext
 
 /** 大疆增强图传模块（EG25G-QDC507）。改过 ID 就换这两个值。 */
 const val VENDOR_ID = 0x2CA3
@@ -59,29 +60,19 @@ data class NetMode(
 val NET_MODES = listOf(
     NetMode(
         0, "QMI / RMNET", "Linux 免驱 · Windows 需驱动",
-        "出厂默认。高通私有协议，性能和可控性最好，软路由/树莓派做 4G 网关都用它。" +
-            "Linux 靠 qmi_wwan 内置支持；Windows 要装移远 NDIS 驱动。" +
-            "macOS 和 iPad 没有也不可能有驱动。",
+        "出厂默认。高通私有协议，软路由做 4G 网关的首选。macOS 和 iPad 无驱动。",
     ),
     NetMode(
         1, "ECM", "macOS · iPad · Linux 免驱",
-        "标准 CDC 以太网，覆盖面最广的选择。模块内部自动建立数据呼叫，" +
-            "主机跑 DHCP 就能上网（网段 192.168.225.x）。" +
-            "macOS / iPadOS / Linux 全部免驱；Windows 装移远官方 ECM 驱动同样可用。",
+        "标准 CDC 以太网，覆盖面最广。模块内部自动拨号，主机跑 DHCP 即可。",
     ),
     NetMode(
         2, "MBIM", "Windows 免驱 · Linux 免驱",
-        "微软移动宽带标准，也是 USB-IF 标准类。Windows 8 以上内置驱动，" +
-            "会当成真正的蜂窝网卡在系统设置里管理，是 Windows 下最省事的选择。" +
-            "Linux 靠 cdc_mbim 支持。macOS 不支持。",
+        "USB-IF 标准类，Windows 下最省事。主机拿真实 IP、支持多 APN。macOS 不支持。",
     ),
     NetMode(
         3, "RNDIS", "仅 Windows XP/7 等老系统",
-        "微软的以太网over USB，属于遗留兼容模式。Linux 的 rndis_host 已被标记弃用。" +
-            "切换后 AT 串口位置会变、数量可能减少——社区里大量「模块变砖」的报告" +
-            "其实是主机写死了原来的串口号。本 App 遍历接口探测，通常能自己找回来，但不保证。" +
-            "ECM 与 MBIM 已覆盖所有现代平台，除非要接 XP/Win7 老设备，否则没有理由选它。",
-        risky = true,
+        "遗留兼容模式，现代平台已无必要。切换后 AT 口会移位，本 App 能自动找回。",
     ),
 )
 
@@ -188,20 +179,39 @@ class Modem(private val ctx: Context) {
      * 写死接口号会导致再也连不上，所以逐个试到谁回 OK 为止。
      * 返回 null 表示成功。
      */
-    suspend fun open(dev: UsbDevice): String? {
+    /**
+     * 打开并探测 AT 口，分三级递进：
+     *   1) 快速：每个候选接口试一次 AT，命中即返回（正常情况一两秒完成）
+     *   2) 彻底：多种指令变体 × DTR 开/关
+     *   3) 延迟重试：等 5 秒再来一遍彻底扫描，应对模块刚重启
+     *
+     * 切换 usbnet 会改变接口布局，所以不认死接口号——这是能在手机上
+     * 恢复「AT 口移位」的关键。全部 USB 读写在 IO 线程执行。
+     */
+    suspend fun open(
+        dev: UsbDevice,
+        onProgress: (String) -> Unit = {},
+    ): String? = withContext(Dispatchers.IO) {
         close()
+        delay(200)
         val mgr = ctx.getSystemService(Context.USB_SERVICE) as UsbManager
-        val c = mgr.openDevice(dev) ?: return "打开设备失败，通常是没有授权。"
+        val c = mgr.openDevice(dev) ?: return@withContext "打开设备失败，通常是没有授权。"
         conn = c
 
-        // 先试标准位置，再试其余接口
-        val order = buildList {
-            if (dev.interfaceCount > AT_INTERFACE_HINT) add(AT_INTERFACE_HINT)
-            for (i in 0 until dev.interfaceCount) if (i != AT_INTERFACE_HINT) add(i)
+        val cands = describe(dev).filter { it.candidate }.map { it.index }
+        if (cands.isEmpty()) {
+            c.close(); conn = null
+            return@withContext "没有任何接口带成对 bulk 端点，模块的 USB 组合里已不含串口。" +
+                "需要接电脑用 Linux 发 AT+QCFG=\"usbnet\",0 恢复。"
         }
 
-        for (idx in order) {
+        // 标准组合里 AT 在 IF2，优先试它
+        val order = cands.filter { it == AT_INTERFACE_HINT } + cands.filter { it != AT_INTERFACE_HINT }
+
+        suspend fun tryIface(idx: Int, thorough: Boolean): Boolean {
             val intf = dev.getInterface(idx)
+            if (!c.claimInterface(intf, true)) return false
+
             var i: UsbEndpoint? = null
             var o: UsbEndpoint? = null
             for (k in 0 until intf.endpointCount) {
@@ -209,129 +219,53 @@ class Modem(private val ctx: Context) {
                 if (ep.type != UsbConstants.USB_ENDPOINT_XFER_BULK) continue
                 if (ep.direction == UsbConstants.USB_DIR_IN) i = ep else o = ep
             }
-            if (i == null || o == null) continue
-            if (!c.claimInterface(intf, true)) continue
-
-            // CDC SET_CONTROL_LINE_STATE，拉高 DTR/RTS。
-            // 少了这步模块收得到指令但不回应。
-            c.controlTransfer(0x21, 0x22, 0x03, idx, null, 0, 1000)
             epIn = i; epOut = o
             startReader()
 
-            if (at("AT", timeoutMs = 1500).contains("OK")) {
-                atInterface = idx
-                prepared = false
-                return null
+            val dtrStates = if (thorough) listOf(true, false) else listOf(true)
+            val variants = if (thorough) listOf("AT\r\n", "AT\r", "ATI\r\n") else listOf("AT\r\n")
+
+            for (dtr in dtrStates) {
+                setLineState(idx, dtr)
+                for (v in variants) {
+                    clear(); delay(60)
+                    write(v)
+                    if (await("OK", "Quectel", "EG25", timeoutMs = if (thorough) 1800 else 1200)) {
+                        atInterface = idx
+                        prepared = false
+                        onProgress("AT 口在 IF$idx")
+                        return true
+                    }
+                }
             }
 
             readerJob?.cancel(); readerJob = null
             runCatching { c.releaseInterface(intf) }
             epIn = null; epOut = null
+            return false
         }
 
-        c.close(); conn = null
-        return "所有接口都不响应 AT 指令。模块可能切到了不带串口的 USB 组合，" +
-            "需要接电脑用 Linux 发 AT+QCFG=\"usbnet\",0 恢复。"
-    }
+        // 1) 快速
+        for (idx in order) {
+            onProgress("探测 IF$idx")
+            if (tryIface(idx, thorough = false)) return@withContext null
+        }
 
-    /** 不需要连接，只读 USB 描述符。诊断用。 */
-    fun describe(dev: UsbDevice): List<IfaceInfo> =
-        (0 until dev.interfaceCount).map { i ->
-            val intf = dev.getInterface(i)
-            var bin = false
-            var bout = false
-            for (k in 0 until intf.endpointCount) {
-                val ep = intf.getEndpoint(k)
-                if (ep.type != UsbConstants.USB_ENDPOINT_XFER_BULK) continue
-                if (ep.direction == UsbConstants.USB_DIR_IN) bin = true else bout = true
+        // 2) 彻底 + 3) 延迟重试
+        repeat(2) { pass ->
+            if (pass == 1) {
+                onProgress("模块可能仍在启动，等 5 秒后重试")
+                delay(5000)
             }
-            IfaceInfo(
-                index = i,
-                cls = intf.interfaceClass,
-                subCls = intf.interfaceSubclass,
-                proto = intf.interfaceProtocol,
-                bulkIn = bin, bulkOut = bout,
-                epCount = intf.endpointCount,
-                inUse = i == atInterface,
-            )
-        }
-
-    /**
-     * 救援模式：加长超时、多轮重试、多种指令变体、DTR 开关都试。
-     * 专治「切换 usbnet 后 AT 口移位 / 模块刚重启还没稳定」。
-     */
-    suspend fun openDeep(dev: UsbDevice, log: (String) -> Unit): String? {
-        close()
-        val mgr = ctx.getSystemService(Context.USB_SERVICE) as UsbManager
-        val c = mgr.openDevice(dev) ?: return "打开设备失败，通常是没有授权。"
-        conn = c
-
-        val cands = (0 until dev.interfaceCount).filter { i ->
-            val intf = dev.getInterface(i)
-            var bin = false; var bout = false
-            for (k in 0 until intf.endpointCount) {
-                val ep = intf.getEndpoint(k)
-                if (ep.type != UsbConstants.USB_ENDPOINT_XFER_BULK) continue
-                if (ep.direction == UsbConstants.USB_DIR_IN) bin = true else bout = true
-            }
-            bin && bout
-        }
-
-        log("共 ${dev.interfaceCount} 个接口，其中 ${cands.size} 个带成对 bulk 端点")
-        if (cands.isEmpty()) {
-            c.close(); conn = null
-            return "没有任何接口带成对 bulk 端点。模块的 USB 组合里已不含串口，" +
-                "手机端无法恢复，需要接电脑处理。"
-        }
-
-        val variants = listOf("AT\r\n", "AT\r", "ATE0\r\n", "ATI\r\n")
-
-        for (round in 1..3) {
-            log("── 第 $round / 3 轮")
-            for (idx in cands) {
-                val intf = dev.getInterface(idx)
-                if (!c.claimInterface(intf, true)) {
-                    log("IF$idx 无法占用，跳过")
-                    continue
-                }
-
-                var i: UsbEndpoint? = null
-                var o: UsbEndpoint? = null
-                for (k in 0 until intf.endpointCount) {
-                    val ep = intf.getEndpoint(k)
-                    if (ep.type != UsbConstants.USB_ENDPOINT_XFER_BULK) continue
-                    if (ep.direction == UsbConstants.USB_DIR_IN) i = ep else o = ep
-                }
-                epIn = i; epOut = o
-
-                for (dtr in listOf(true, false)) {
-                    if (dtr) c.controlTransfer(0x21, 0x22, 0x03, idx, null, 0, 1000)
-                    startReader()
-                    for (v in variants) {
-                        clear(); delay(60)
-                        write(v)
-                        if (await("OK", "Quectel", timeoutMs = 2500)) {
-                            atInterface = idx
-                            prepared = false
-                            log("✓ IF$idx 响应了（${v.trim()}，DTR ${if (dtr) "开" else "关"}）")
-                            return null
-                        }
-                    }
-                    readerJob?.cancel(); readerJob = null
-                }
-                log("IF$idx 无响应")
-                runCatching { c.releaseInterface(intf) }
-                epIn = null; epOut = null
-            }
-            if (round < 3) {
-                log("等 8 秒后重试，模块可能仍在启动")
-                delay(8000)
+            for (idx in order) {
+                onProgress("深入探测 IF$idx")
+                if (tryIface(idx, thorough = true)) return@withContext null
             }
         }
 
         c.close(); conn = null
-        return "三轮探测都没有接口响应 AT。若刚切换过 usbnet，再等一分钟重试；" +
-            "仍然不行则需要接电脑用 Linux 恢复。"
+        "遍历全部 ${cands.size} 个接口都没有响应 AT。若刚切换过 usbnet 或重启过模块，" +
+            "稍等一分钟再点连接；仍然不行则需要接电脑用 Linux 恢复。"
     }
 
     fun close() {
@@ -384,13 +318,20 @@ class Modem(private val ctx: Context) {
         }
     }
 
-    private fun write(s: String) {
+    // bulkTransfer / controlTransfer 都是同步阻塞的 JNI 调用，
+    // 绝不能在主线程执行，否则批量探测时必然 ANR。
+    private suspend fun write(s: String) = withContext(Dispatchers.IO) {
         val d = s.toByteArray(Charsets.ISO_8859_1)
-        conn?.bulkTransfer(epOut, d, d.size, 3000)
+        conn?.bulkTransfer(epOut, d, d.size, 1500)
     }
 
-    private fun writeByte(b: Byte) {
-        conn?.bulkTransfer(epOut, byteArrayOf(b), 1, 3000)
+    private suspend fun writeByte(b: Byte) = withContext(Dispatchers.IO) {
+        conn?.bulkTransfer(epOut, byteArrayOf(b), 1, 1500)
+    }
+
+    private suspend fun setLineState(iface: Int, on: Boolean) = withContext(Dispatchers.IO) {
+        // CDC SET_CONTROL_LINE_STATE：0x03 = DTR+RTS 拉高，0x00 = 全部拉低
+        conn?.controlTransfer(0x21, 0x22, if (on) 0x03 else 0x00, iface, null, 0, 800)
     }
 
     private fun snapshot(): String = synchronized(buf) { buf.toString() }
