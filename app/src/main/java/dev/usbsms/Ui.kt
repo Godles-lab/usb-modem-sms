@@ -483,7 +483,14 @@ private fun MessageCard(
                 Modifier
                     .background(Amber.copy(alpha = 0.12f), RoundedCornerShape(10.dp))
                     .border(1.dp, Amber.copy(alpha = 0.45f), RoundedCornerShape(10.dp))
-                    .clickable { clip.setText(AnnotatedString(code)) }
+                    .clickable {
+                        clip.setText(AnnotatedString(code))
+                        // Android 13 起系统自带「已复制」提示，再弹 snackbar 是重复。
+                        // 低版本没有，不补一个的话点下去毫无反馈。
+                        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) {
+                            onCopied(code)
+                        }
+                    }
                     .padding(horizontal = 12.dp, vertical = 8.dp),
                 verticalAlignment = Alignment.CenterVertically,
             ) {
@@ -809,6 +816,18 @@ private val QUICK_CMDS = listOf(
     "ATI",
 )
 
+/**
+ * 会改写 USB 接口组合的**写入**指令。`usbcfg` 能把全部 USB 接口关掉、
+ * `usbauto` 能让模块只枚举 RNDIS —— 两者都会让 AT 串口彻底消失，
+ * 之后手机和电脑都连不上，只能进 EDL 模式用签名的 loader 刷机救。
+ *
+ * 靠参数名后面紧跟逗号来区分读写：`AT+QCFG="usbcfg"` 是查询，放行；
+ * `AT+QCFG="usbcfg",0x2C7C,...` 是写入，拦下。
+ */
+private val DANGEROUS_AT = Regex("""usb(cfg|auto|mode)\s*"?\s*,""", RegexOption.IGNORE_CASE)
+
+internal fun isDangerousAt(cmd: String): Boolean = DANGEROUS_AT.containsMatchIn(cmd)
+
 @Composable
 private fun ConsoleDialog(
     log: String,
@@ -818,9 +837,60 @@ private fun ConsoleDialog(
     onDismiss: () -> Unit,
 ) {
     var cmd by remember { mutableStateOf("") }
+    var danger by remember { mutableStateOf<String?>(null) }
     val scroll = rememberScrollState()
 
     LaunchedEffect(log) { scroll.animateScrollTo(scroll.maxValue) }
+
+    /** 危险指令先扣下来要二次确认，其余原样下发 */
+    fun submit(c: String) {
+        val t = c.trim()
+        if (t.isBlank()) return
+        if (isDangerousAt(t)) danger = t else { onRun(t); cmd = "" }
+    }
+
+    danger?.let { c ->
+        AlertDialog(
+            containerColor = Panel,
+            titleContentColor = Alert,
+            textContentColor = TextLo,
+            onDismissRequest = { danger = null },
+            title = { Text("这条指令可能让模块变砖") },
+            text = {
+                Column(Modifier.verticalScroll(rememberScrollState())) {
+                    Box(
+                        Modifier
+                            .fillMaxWidth()
+                            .background(Ink, RoundedCornerShape(8.dp))
+                            .border(1.dp, Alert.copy(alpha = 0.4f), RoundedCornerShape(8.dp))
+                            .padding(10.dp)
+                    ) { Text(c, style = Mono, color = Alert) }
+                    Spacer(Modifier.height(12.dp))
+                    Text(
+                        "它会改写模块的 USB 接口组合，而不是网络模式。" +
+                            "写错会关掉全部 USB 接口（包括 AT 串口）—— " +
+                            "届时本 App 和电脑都再也连不上，只能进 EDL 模式" +
+                            "用签名的 loader 刷机才能救回来。",
+                        color = Alert, fontSize = 13.sp, lineHeight = 19.sp,
+                    )
+                    Spacer(Modifier.height(10.dp))
+                    Text(
+                        "想换 4G 网络模式请用菜单里的「USB 模式」，" +
+                            "那里走的是 usbnet 参数，串口一定保留，可逆。",
+                        color = TextLo, fontSize = 12.sp, lineHeight = 18.sp,
+                    )
+                }
+            },
+            confirmButton = {
+                TextButton(onClick = { onRun(c); cmd = ""; danger = null }) {
+                    Text("我清楚后果，执行", color = Alert)
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { danger = null }) { Text("取消", color = TextLo) }
+            },
+        )
+    }
 
     AlertDialog(
         containerColor = Panel,
@@ -841,7 +911,7 @@ private fun ConsoleDialog(
                         Box(
                             Modifier
                                 .border(1.dp, Hairline, RoundedCornerShape(7.dp))
-                                .clickable(enabled = !busy) { onRun(q) }
+                                .clickable(enabled = !busy) { submit(q) }
                                 .padding(horizontal = 8.dp, vertical = 4.dp)
                         ) { Text(q.removePrefix("AT+").removeSuffix("?"), style = Readout, color = Amber) }
                     }
@@ -852,7 +922,7 @@ private fun ConsoleDialog(
                         Box(
                             Modifier
                                 .border(1.dp, Hairline, RoundedCornerShape(7.dp))
-                                .clickable(enabled = !busy) { onRun(q) }
+                                .clickable(enabled = !busy) { submit(q) }
                                 .padding(horizontal = 8.dp, vertical = 4.dp)
                         ) { Text(q.removePrefix("AT+").removeSuffix("?"), style = Readout, color = Amber) }
                     }
@@ -888,7 +958,7 @@ private fun ConsoleDialog(
                                 RoundedCornerShape(10.dp),
                             )
                             .clickable(enabled = !busy && cmd.isNotBlank()) {
-                                onRun(cmd.trim()); cmd = ""
+                                submit(cmd)
                             }
                             .padding(horizontal = 14.dp, vertical = 12.dp)
                     ) {
