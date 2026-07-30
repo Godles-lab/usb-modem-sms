@@ -43,18 +43,31 @@ jobs:
           echo "APP_VERSION=$V" >> "$GITHUB_ENV"
           echo "版本 $V"
 
+      # 没有正式密钥就直接失败，绝不退回调试证书。
+      # 调试证书每台 runner 现场生成、每次都不一样，装到手机上会与已装版本
+      # 签名冲突，系统在扫描阶段中止安装并报「解析包错误」——字面完全指向
+      # 错误方向，v1.3.0 就是这么废掉的。宁可不发版，也不要发一个装不上的包。
       - name: 准备签名密钥
         env:
           KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
         run: |
-          if [ -n "$KEYSTORE_BASE64" ]; then
-            echo "$KEYSTORE_BASE64" | base64 -d > "$RUNNER_TEMP/release.jks"
-            echo "KEYSTORE_FILE=$RUNNER_TEMP/release.jks" >> "$GITHUB_ENV"
-            echo "使用正式签名"
-          else
-            echo "未配置 KEYSTORE_BASE64，将退回调试证书签名"
-            echo "该产物可安装，但无法覆盖升级已装的其他签名版本"
+          missing=""
+          [ -n "$KEYSTORE_BASE64" ]   || missing="$missing KEYSTORE_BASE64"
+          [ -n "$KEYSTORE_PASSWORD" ] || missing="$missing KEYSTORE_PASSWORD"
+          [ -n "$KEY_ALIAS" ]         || missing="$missing KEY_ALIAS"
+          [ -n "$KEY_PASSWORD" ]      || missing="$missing KEY_PASSWORD"
+          if [ -n "$missing" ]; then
+            echo "::error::缺少签名 secret:$missing"
+            echo "在 Settings → Secrets and variables → Actions 补齐这四项后重新打 tag。"
+            echo "或者在本机构建后手动上传（见开发笔记的发版流程）。"
+            exit 1
           fi
+          echo "$KEYSTORE_BASE64" | base64 -d > "$RUNNER_TEMP/release.jks"
+          echo "KEYSTORE_FILE=$RUNNER_TEMP/release.jks" >> "$GITHUB_ENV"
+          echo "已载入正式签名密钥"
 
       - name: 编译 release APK
         env:
@@ -65,6 +78,26 @@ jobs:
           gradle assembleRelease --no-daemon --stacktrace \
             -PversionName="$APP_VERSION" \
             -PversionCode="${GITHUB_RUN_NUMBER}"
+
+      # 上一步只保证密钥存在，这一步保证它真的用上了。
+      # 少了这道断言，构建配置一旦回归就会把调试证书包一路发到 Release。
+      - name: 校验产物签名
+        run: |
+          APKSIGNER=$(ls "$ANDROID_HOME"/build-tools/*/apksigner | sort -V | tail -1)
+          APK=$(ls app/build/outputs/apk/release/*.apk | head -1)
+          "$APKSIGNER" verify --verbose --print-certs "$APK" | tee /tmp/certs.txt
+          if grep -q "CN=Android Debug" /tmp/certs.txt; then
+            echo "::error::产物是调试证书签名的，拒绝发布"
+            exit 1
+          fi
+          grep -q "v2 scheme (APK Signature Scheme v2): true" /tmp/certs.txt || {
+            echo "::error::v2 签名缺失"; exit 1; }
+          "$APKSIGNER" verify --min-sdk-version 21 --max-sdk-version 23 "$APK" >/dev/null || {
+            echo "::error::v1 (JAR) 签名缺失，部分国产 ROM 会报解析包错误"; exit 1; }
+          ZIPALIGN=$(ls "$ANDROID_HOME"/build-tools/*/zipalign | sort -V | tail -1)
+          "$ZIPALIGN" -c -P 16 -v 4 "$APK" >/dev/null || {
+            echo "::error::16KB 页对齐不满足，Android 15+ 装不上"; exit 1; }
+          echo "签名与对齐校验通过"
 
       - name: 上传构建产物
         uses: actions/upload-artifact@v4
