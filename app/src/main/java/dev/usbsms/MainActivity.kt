@@ -10,6 +10,7 @@ import android.os.Build
 import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
+import androidx.activity.SystemBarStyle
 import androidx.activity.enableEdgeToEdge
 import androidx.compose.material3.SnackbarHostState
 import androidx.compose.runtime.getValue
@@ -30,12 +31,14 @@ class MainActivity : ComponentActivity() {
     private var status by mutableStateOf("未连接")
     private var connected by mutableStateOf(false)
     private var busy by mutableStateOf(false)
+    private var connecting = false
     private var current by mutableStateOf("ME")
     private var tele by mutableStateOf(Telemetry())
     private var netMode by mutableStateOf<Int?>(null)
     private var modeLoading by mutableStateOf(false)
     private var console by mutableStateOf("")
     private var backup by mutableStateOf<ConfigBackup?>(null)
+    private var identity by mutableStateOf<Identity?>(null)
     private val ifaces = mutableStateListOf<IfaceInfo>()
 
     private val prefs: SharedPreferences by lazy {
@@ -55,10 +58,12 @@ class MainActivity : ComponentActivity() {
                 UsbManager.ACTION_USB_DEVICE_ATTACHED -> connect()
 
                 UsbManager.ACTION_USB_DEVICE_DETACHED -> {
+                    connecting = false
                     modem.close()
                     connected = false
                     smsList.clear(); storages.clear(); supported.clear()
                     tele = Telemetry(); atIf = -1
+                    identity = null; backup = null
                     if (!status.startsWith("已切换到")) {
                         status = "模块已断开。若是突然掉线，多半是 OTG 供电不足。"
                     }
@@ -69,11 +74,18 @@ class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        enableEdgeToEdge()
+
+        // enableEdgeToEdge() 默认按系统的浅色/深色模式决定系统栏图标颜色，
+        // 而本应用界面恒为深色。系统处于浅色模式时会被设成黑色图标，
+        // 压在深靛蓝背景上完全看不见。这里显式声明「深色背景」，
+        // 强制系统栏使用浅色图标，与系统主题无关。
+        enableEdgeToEdge(
+            statusBarStyle = SystemBarStyle.dark(android.graphics.Color.TRANSPARENT),
+            navigationBarStyle = SystemBarStyle.dark(android.graphics.Color.TRANSPARENT),
+        )
 
         modem = Modem(this)
         modem.onNewSms = { lifecycleScope.launch { refresh() } }
-        loadBackup()
 
         val filter = IntentFilter().apply {
             addAction(ACTION_USB_PERMISSION)
@@ -98,6 +110,7 @@ class MainActivity : ComponentActivity() {
                     modeLoading = modeLoading,
                     console = console,
                     backup = backup,
+                    identity = identity,
                     ifaces = ifaces,
                     atIf = atIf,
                     sms = smsList,
@@ -120,6 +133,7 @@ class MainActivity : ComponentActivity() {
                         lifecycleScope.launch { snackbar.showSnackbar("已复制 $c") }
                     },
                     onRestore = { lifecycleScope.launch { restore() } },
+                    onSaveBackup = { lifecycleScope.launch { saveBackupManual() } },
                 )
             }
         }
@@ -136,38 +150,56 @@ class MainActivity : ComponentActivity() {
     // ---------- 动作 ----------
 
     private fun connect() {
+        // onCreate 与 USB 广播都会调这里。不加锁会让两个协程在
+        // supported / storages 列表上竞争，界面出现重复的存储区按钮。
+        if (connecting) return
+        connecting = true
+
         lifecycleScope.launch {
-            val dev = modem.findDevice()
-            if (dev == null) {
-                status = "没找到模块。确认已插好，并使用带外部供电的 OTG 转接头。"
-                connected = false
-                return@launch
-            }
-            if (!modem.hasPermission(dev)) {
-                status = "正在请求 USB 授权…"
-                modem.requestPermission(dev)
-                return@launch
-            }
+            try {
+                val dev = modem.findDevice()
+                if (dev == null) {
+                    status = "没找到模块。确认已插好，并使用带外部供电的 OTG 转接头。"
+                    connected = false
+                    return@launch
+                }
+                if (!modem.hasPermission(dev)) {
+                    status = "正在请求 USB 授权…"
+                    modem.requestPermission(dev)
+                    return@launch
+                }
 
-            status = "正在探测 AT 口…"
-            val err = modem.open(dev)
-            if (err != null) {
-                status = err
-                connected = false
-                return@launch
-            }
+                status = "正在探测 AT 口…"
+                val err = modem.open(dev) { p -> runOnUiThread { status = p } }
+                if (err != null) {
+                    status = err
+                    connected = false
+                    return@launch
+                }
 
-            connected = true
-            atIf = modem.atIfIndex
-            status = "初始化中…"
-            modem.init()
-            supported.clear()
-            supported.addAll(modem.supportedStorages())
-            current = modem.storage
-            netMode = modem.usbnetMode()
-            refreshIfaces()
-            if (backup == null) saveBackup()
-            refresh()
+                connected = true
+                atIf = modem.atIfIndex
+                status = "初始化中…"
+                modem.init()
+
+                // 先确认这颗模块的身份，备份才能按模块区分
+                val id = modem.identity()
+                identity = id
+                loadBackup(id.key)
+                if (backup == null) saveBackup()
+
+                // 先取到完整结果再一次性替换，避免中间态被界面读到
+                val st = modem.supportedStorages()
+                supported.clear()
+                supported.addAll(st)
+
+                current = modem.storage
+                netMode = modem.usbnetMode()
+                refreshIfaces()
+                refresh()
+            } finally {
+                connecting = false
+            }
         }
     }
 
@@ -178,21 +210,43 @@ class MainActivity : ComponentActivity() {
         modem.findDevice()?.let { ifaces.addAll(modem.describe(it)) }
     }
 
-    private fun loadBackup() {
-        val net = prefs.getString("bk_usbnet", null) ?: return
+    // 备份按 IMEI 分键存储。两颗同型号模块的 VID/PID 完全相同，
+    // 不按 IMEI 区分就会把 A 的配置恢复到 B 上。
+    private fun bk(key: String, field: String) = "bk.$key.$field"
+
+    private fun loadBackup(key: String) {
+        val net = prefs.getString(bk(key, "usbnet"), null)
+        if (net == null) {
+            backup = null
+            return
+        }
         backup = ConfigBackup(
-            net,
-            prefs.getString("bk_usbcfg", "") ?: "",
-            prefs.getLong("bk_at", 0L),
+            imei = prefs.getString(bk(key, "imei"), "") ?: "",
+            model = prefs.getString(bk(key, "model"), "") ?: "",
+            usbnet = net,
+            usbcfg = prefs.getString(bk(key, "usbcfg"), "") ?: "",
+            savedAt = prefs.getLong(bk(key, "at"), 0L),
         )
+    }
+
+    /** 用户主动把当前配置设为新的恢复点。 */
+    private suspend fun saveBackupManual() {
+        if (!connected || busy) return
+        busy = true
+        val ok = runCatching { saveBackup(); true }.getOrDefault(false)
+        busy = false
+        snackbar.showSnackbar(if (ok) "已把当前配置存为恢复点" else "读取配置失败")
     }
 
     private suspend fun saveBackup() {
         val b = runCatching { modem.readBackup() }.getOrNull() ?: return
+        val key = b.imei.ifBlank { "unknown" }
         prefs.edit()
-            .putString("bk_usbnet", b.usbnet)
-            .putString("bk_usbcfg", b.usbcfg)
-            .putLong("bk_at", b.savedAt)
+            .putString(bk(key, "imei"), b.imei)
+            .putString(bk(key, "model"), b.model)
+            .putString(bk(key, "usbnet"), b.usbnet)
+            .putString(bk(key, "usbcfg"), b.usbcfg)
+            .putLong(bk(key, "at"), b.savedAt)
             .apply()
         backup = b
     }

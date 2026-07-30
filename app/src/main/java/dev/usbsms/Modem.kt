@@ -114,8 +114,22 @@ data class IfaceInfo(
         )
 }
 
-/** 切换模式前保存的原始配置，用于恢复。 */
-data class ConfigBackup(val usbnet: String, val usbcfg: String, val savedAt: Long)
+/** 模块身份。IMEI 每颗唯一，是区分同型号模块的唯一可靠依据。 */
+data class Identity(val imei: String, val model: String) {
+    val key: String get() = imei.ifBlank { "unknown" }
+    /** 界面上显示用，型号 + IMEI 后六位 */
+    val short: String
+        get() = listOf(model, imei.takeLast(6)).filter { it.isNotBlank() }.joinToString(" · ")
+}
+
+/** 切换模式前保存的原始配置，用于恢复。按 IMEI 区分不同模块。 */
+data class ConfigBackup(
+    val imei: String,
+    val model: String,
+    val usbnet: String,
+    val usbcfg: String,
+    val savedAt: Long,
+)
 
 /** 顶部状态行的实时读数。 */
 data class Telemetry(
@@ -557,16 +571,47 @@ class Modem(private val ctx: Context) {
 
     // ---------- USB 网络模式 ----------
 
-    /** 读出 usbnet 与 usbcfg 的原始返回，切换前备份用。 */
+    /**
+     * 读模块身份。IMEI 是从模块读的（AT+CGSN），不是手机的 IMEI，
+     * 所以不需要任何安卓权限。
+     *
+     * ioLock 是不可重入的 Mutex，所以拆成不加锁的内部版本供其他
+     * 已持锁的方法复用。
+     */
+    private suspend fun readIdentityLocked(): Identity {
+        val imei = at("AT+CGSN").lines()
+            .map { it.trim() }
+            .firstOrNull { it.length in 14..17 && it.all(Char::isDigit) }
+            ?: ""
+        val ati = at("ATI").lines().map { it.trim() }
+        val model = ati.firstOrNull { it.startsWith("Revision:", true) }
+            ?.substringAfter(":")?.trim()
+            ?: ati.firstOrNull { it.startsWith("EG", true) || it.startsWith("EC", true) }
+            ?: ""
+        return Identity(imei, model)
+    }
+
+    suspend fun identity(): Identity = ioLock.withLock {
+        prepare()
+        at("AT+CSCS=\"GSM\"")
+        try {
+            readIdentityLocked()
+        } finally {
+            at("AT+CSCS=\"UCS2\"")
+        }
+    }
+
+    /** 读出 usbnet 与 usbcfg 的原始返回，连同模块身份一起返回。 */
     suspend fun readBackup(): ConfigBackup? = ioLock.withLock {
         prepare()
         at("AT+CSCS=\"GSM\"")
         try {
+            val id = readIdentityLocked()
             val net = at("AT+QCFG=\"usbnet\"", expect = "+QCFG:")
                 .lines().firstOrNull { it.contains("+QCFG:") }?.trim() ?: return@withLock null
             val cfg = at("AT+QCFG=\"usbcfg\"", expect = "+QCFG:")
                 .lines().firstOrNull { it.contains("+QCFG:") }?.trim() ?: ""
-            ConfigBackup(net, cfg, System.currentTimeMillis())
+            ConfigBackup(id.imei, id.model, net, cfg, System.currentTimeMillis())
         } finally {
             at("AT+CSCS=\"UCS2\"")
         }

@@ -10,6 +10,7 @@ import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.background
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
@@ -72,6 +73,7 @@ fun Screen(
     modeLoading: Boolean,
     console: String,
     backup: ConfigBackup?,
+    identity: Identity?,
     ifaces: List<IfaceInfo>,
     atIf: Int,
     sms: List<Sms>,
@@ -92,6 +94,7 @@ fun Screen(
     onRefreshIfaces: () -> Unit,
     onCopied: (String) -> Unit,
     onRestore: () -> Unit,
+    onSaveBackup: () -> Unit,
 ) {
     var number by remember { mutableStateOf("") }
     var text by remember { mutableStateOf("") }
@@ -140,8 +143,10 @@ fun Screen(
             loading = modeLoading,
             busy = busy,
             backup = backup,
+            identity = identity,
             onReload = onReadMode,
             onRestore = onRestore,
+            onSaveBackup = onSaveBackup,
             onDismiss = { modeSheet = false },
             onPick = { m -> modeSheet = false; confirmMode = m },
         )
@@ -265,7 +270,7 @@ private fun Header(
     openIfaces: () -> Unit,
 ) {
     Row(
-        Modifier.fillMaxWidth().padding(start = 16.dp, end = 8.dp, top = 14.dp, bottom = 10.dp),
+        Modifier.fillMaxWidth().padding(start = 16.dp, end = 8.dp, top = 20.dp, bottom = 10.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
         LinkDot(connected)
@@ -407,7 +412,10 @@ private fun StorageRow(
     onPick: (String) -> Unit,
 ) {
     Row(
-        Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 4.dp),
+        Modifier
+            .fillMaxWidth()
+            .horizontalScroll(rememberScrollState())
+            .padding(horizontal = 16.dp, vertical = 4.dp),
         horizontalArrangement = Arrangement.spacedBy(8.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
@@ -636,8 +644,10 @@ private fun ModeDialog(
     loading: Boolean,
     busy: Boolean,
     backup: ConfigBackup?,
+    identity: Identity?,
     onReload: () -> Unit,
     onRestore: () -> Unit,
+    onSaveBackup: () -> Unit,
     onDismiss: () -> Unit,
     onPick: (NetMode) -> Unit,
 ) {
@@ -664,35 +674,77 @@ private fun ModeDialog(
                         Spacer(Modifier.height(12.dp))
                     }
                 }
-                backup?.let { b ->
-                    Box(
-                        Modifier
-                            .fillMaxWidth()
-                            .background(Signal.copy(alpha = 0.08f), RoundedCornerShape(10.dp))
-                            .border(1.dp, Signal.copy(alpha = 0.35f), RoundedCornerShape(10.dp))
-                            .padding(10.dp)
-                    ) {
-                        Column {
-                            Text("已备份原始配置", style = Readout, color = Signal)
+                identity?.let { id ->
+                    Text(
+                        "当前模块  ${id.short.ifBlank { "身份未知" }}",
+                        style = Readout,
+                        color = TextLo,
+                    )
+                    Spacer(Modifier.height(10.dp))
+                }
+
+                Box(
+                    Modifier
+                        .fillMaxWidth()
+                        .background(
+                            if (backup != null) Signal.copy(alpha = 0.07f) else PanelHi,
+                            RoundedCornerShape(10.dp),
+                        )
+                        .border(
+                            1.dp,
+                            if (backup != null) Signal.copy(alpha = 0.3f) else Hairline,
+                            RoundedCornerShape(10.dp),
+                        )
+                        .padding(10.dp)
+                ) {
+                    Column {
+                        val b = backup
+                        if (b == null) {
+                            Text("尚无恢复点", style = Readout, color = TextLo)
                             Spacer(Modifier.height(4.dp))
                             Text(
-                                b.usbnet,
-                                fontSize = 11.sp,
+                                "连接模块后会自动保存一份当前配置。",
+                                color = TextLo, fontSize = 11.sp, lineHeight = 16.sp,
+                            )
+                        } else {
+                            val sameModule = identity == null ||
+                                b.imei.isBlank() || b.imei == identity.imei
+                            val bkMode = qcfgValue(b.usbnet)
+                            val bkName = NET_MODES.firstOrNull { it.code == bkMode }?.name
+
+                            Text(
+                                if (sameModule) "恢复点  ${bkName ?: b.usbnet}"
+                                else "此恢复点属于另一颗模块",
+                                style = Readout,
+                                color = if (sameModule) Signal else Alert,
+                            )
+                            Spacer(Modifier.height(3.dp))
+                            Text(
+                                listOfNotNull(
+                                    b.imei.takeIf { it.isNotBlank() }?.let { "IMEI $it" },
+                                    b.savedAt.takeIf { it > 0 }?.let { fmtTime(it) },
+                                ).joinToString("  ·  "),
+                                fontSize = 10.sp,
                                 fontFamily = FontFamily.Monospace,
                                 color = TextLo,
                             )
-                            if (b.usbcfg.isNotBlank()) {
-                                Text(
-                                    b.usbcfg,
-                                    fontSize = 11.sp,
-                                    fontFamily = FontFamily.Monospace,
-                                    color = TextLo,
-                                )
+                            Spacer(Modifier.height(6.dp))
+                            Text(
+                                "首次连接时自动保存，之后不会自动更新——" +
+                                    "否则切换模式后就丢失了原始配置的记录。",
+                                color = TextLo, fontSize = 11.sp, lineHeight = 16.sp,
+                            )
+                            Spacer(Modifier.height(8.dp))
+                            Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                                if (sameModule && bkMode != null && bkMode != current) {
+                                    MiniAction("恢复到此配置", Signal, !busy, onRestore)
+                                }
+                                MiniAction("以当前配置覆盖", Amber, !busy, onSaveBackup)
                             }
                         }
                     }
-                    Spacer(Modifier.height(10.dp))
                 }
+                Spacer(Modifier.height(12.dp))
 
                 NET_MODES.forEach { m ->
                     val on = m.code == current
@@ -738,15 +790,8 @@ private fun ModeDialog(
             TextButton(onClick = onDismiss) { Text("关闭", color = TextLo) }
         },
         dismissButton = {
-            Row {
-                if (backup != null) {
-                    TextButton(onClick = onRestore, enabled = !busy) {
-                        Text("恢复备份", color = Signal)
-                    }
-                }
-                TextButton(onClick = onReload, enabled = !loading && !busy) {
-                    Text("重新读取", color = if (loading) Hairline else Amber)
-                }
+            TextButton(onClick = onReload, enabled = !loading && !busy) {
+                Text("重新读取", color = if (loading) Hairline else Amber)
             }
         },
     )
@@ -926,3 +971,31 @@ private fun IfaceDialog(
         dismissButton = { TextButton(onClick = onRefresh) { Text("刷新", color = Amber) } },
     )
 }
+
+
+private fun fmtTime(ms: Long): String = runCatching {
+    java.text.SimpleDateFormat("yy/MM/dd HH:mm", java.util.Locale.getDefault())
+        .format(java.util.Date(ms))
+}.getOrDefault("")
+
+
+@Composable
+private fun MiniAction(
+    label: String,
+    color: Color,
+    enabled: Boolean,
+    onClick: () -> Unit,
+) {
+    Box(
+        Modifier
+            .border(1.dp, if (enabled) color.copy(alpha = 0.5f) else Hairline, RoundedCornerShape(7.dp))
+            .clickable(enabled = enabled) { onClick() }
+            .padding(horizontal = 10.dp, vertical = 5.dp)
+    ) {
+        Text(label, style = Readout, color = if (enabled) color else Hairline)
+    }
+}
+
+/** 从 +QCFG 响应行里取模式值 */
+private fun qcfgValue(line: String): Int? =
+    Regex("""(\d+)\s*$""").find(line.trim())?.groupValues?.get(1)?.toIntOrNull()
