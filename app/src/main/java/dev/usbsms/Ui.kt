@@ -13,6 +13,7 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -134,7 +135,7 @@ fun Screen(
     }
 
     if (consoleOpen) {
-        ConsoleDialog(console, busy, onRunAt, onClearConsole) { consoleOpen = false }
+        ConsoleDialog(console, busy, onRunAt, onClearConsole, onCopied) { consoleOpen = false }
     }
 
     if (modeSheet) {
@@ -834,11 +835,13 @@ private fun ConsoleDialog(
     busy: Boolean,
     onRun: (String) -> Unit,
     onClear: () -> Unit,
+    onCopied: (String) -> Unit,
     onDismiss: () -> Unit,
 ) {
     var cmd by remember { mutableStateOf("") }
     var danger by remember { mutableStateOf<String?>(null) }
     val scroll = rememberScrollState()
+    val clip = LocalClipboardManager.current
 
     LaunchedEffect(log) { scroll.animateScrollTo(scroll.maxValue) }
 
@@ -938,13 +941,17 @@ private fun ConsoleDialog(
                         .verticalScroll(scroll)
                         .padding(10.dp)
                 ) {
-                    Text(
-                        log.ifBlank { "点上面的快捷指令，或在下方输入。" },
-                        color = if (log.isBlank()) TextLo else TextHi,
-                        fontSize = 11.sp,
-                        lineHeight = 16.sp,
-                        fontFamily = FontFamily.Monospace,
-                    )
+                    // 包一层 SelectionContainer，长按就能选中任意一段复制；
+                    // 整段复制走下面的「复制」按钮。
+                    SelectionContainer {
+                        Text(
+                            log.ifBlank { "点上面的快捷指令，或在下方输入。" },
+                            color = if (log.isBlank()) TextLo else TextHi,
+                            fontSize = 11.sp,
+                            lineHeight = 16.sp,
+                            fontFamily = FontFamily.Monospace,
+                        )
+                    }
                 }
 
                 Spacer(Modifier.height(8.dp))
@@ -973,7 +980,22 @@ private fun ConsoleDialog(
             }
         },
         confirmButton = { TextButton(onClick = onDismiss) { Text("关闭", color = TextLo) } },
-        dismissButton = { TextButton(onClick = onClear) { Text("清空", color = TextLo) } },
+        dismissButton = {
+            Row {
+                TextButton(
+                    enabled = log.isNotBlank(),
+                    onClick = {
+                        clip.setText(AnnotatedString(log))
+                        // 同 MessageCard：Android 13 起系统自带「已复制」提示，
+                        // 低版本没有，不补 snackbar 的话点下去毫无反馈。
+                        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) {
+                            onCopied("控制台全部输出")
+                        }
+                    },
+                ) { Text("复制", color = if (log.isBlank()) Hairline else Amber) }
+                TextButton(onClick = onClear) { Text("清空", color = TextLo) }
+            }
+        },
     )
 }
 
