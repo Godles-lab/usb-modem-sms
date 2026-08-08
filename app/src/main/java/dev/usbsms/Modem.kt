@@ -667,7 +667,8 @@ fun maybeUcs2(s: String): String {
     if (!t.all { it in "0123456789ABCDEFabcdef" }) return s
     return try {
         val out = t.chunked(4).map { it.toInt(16).toChar() }.joinToString("")
-        if (out.any { it.code < 0x20 && it != '\n' && it != '\t' }) s else out
+        // 运营商短信里 000D000A（CRLF）很常见，漏了 '\r' 会让整条短信退回十六进制。
+        if (out.any { it.code < 0x20 && it != '\n' && it != '\r' && it != '\t' }) s else out
     } catch (e: Exception) {
         s
     }
